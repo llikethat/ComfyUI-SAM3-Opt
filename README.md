@@ -2,7 +2,7 @@
 
 **Memory-efficient SAM3 video segmentation for ComfyUI.**
 
-Node hat processes long videos (1000+ frames) without GPU out-of-memory errors.
+Drop-in replacement for [PozzettiAndrea/ComfyUI-SAM3](https://github.com/PozzettiAndrea/ComfyUI-SAM3) that processes long videos (1000+ frames) without GPU out-of-memory errors.
 
 ## Why This Exists
 

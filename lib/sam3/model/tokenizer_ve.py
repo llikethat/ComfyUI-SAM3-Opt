@@ -20,7 +20,17 @@ from typing import List, Optional, Union
 import ftfy
 import regex as re
 import torch
-from iopath.common.file_io import g_pathmgr
+
+# Try to import iopath, fallback to standard open
+try:
+    from iopath.common.file_io import g_pathmgr
+except ImportError:
+    # Fallback: create a simple wrapper that uses standard open
+    class _SimplePathMgr:
+        @staticmethod
+        def open(path, mode="r"):
+            return open(path, mode)
+    g_pathmgr = _SimplePathMgr()
 
 
 # https://stackoverflow.com/q/62691279

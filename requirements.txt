@@ -1,5 +1,10 @@
 torch>=2.0.0
+torchvision>=0.15.0
 numpy
 opencv-python
 tqdm
 Pillow
+huggingface_hub
+ftfy
+regex
+timm>=1.0.0

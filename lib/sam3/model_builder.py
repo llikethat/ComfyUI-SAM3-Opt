@@ -5,11 +5,27 @@
 import os
 from typing import Optional
 
-import pkg_resources
+# Replace pkg_resources with os.path-based asset finding
+def _get_asset_path(filename):
+    """Get path to asset file relative to this module."""
+    module_dir = os.path.dirname(os.path.abspath(__file__))
+    return os.path.join(module_dir, "assets", filename)
+
 import torch
 import torch.nn as nn
 from huggingface_hub import hf_hub_download
-from iopath.common.file_io import g_pathmgr
+
+# Try to import iopath, fallback to standard open
+try:
+    from iopath.common.file_io import g_pathmgr
+except ImportError:
+    # Fallback: create a simple wrapper that uses standard open
+    class _SimplePathMgr:
+        @staticmethod
+        def open(path, mode="r"):
+            return open(path, mode)
+    g_pathmgr = _SimplePathMgr()
+
 from sam3.model.decoder import (
     TransformerDecoder,
     TransformerDecoderLayer,
@@ -583,9 +599,7 @@ def build_sam3_image_model(
         A SAM3 image model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _get_asset_path("bpe_simple_vocab_16e6.txt.gz")
 
     # Create visual components
     compile_mode = "default" if compile else None
@@ -672,9 +686,7 @@ def build_sam3_video_model(
         Sam3VideoInferenceWithInstanceInteractivity: The instantiated dense tracking model
     """
     if bpe_path is None:
-        bpe_path = pkg_resources.resource_filename(
-            "sam3", "assets/bpe_simple_vocab_16e6.txt.gz"
-        )
+        bpe_path = _get_asset_path("bpe_simple_vocab_16e6.txt.gz")
 
     # Build Tracker module
     tracker = build_tracker(apply_temporal_disambiguation=apply_temporal_disambiguation)
