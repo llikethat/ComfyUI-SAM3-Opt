@@ -220,6 +220,10 @@ class SAM3Propagate:
         orig_w = video_state["orig_width"]
         n_frames = c_end - c_start
 
+        # Convert device to torch.device if it's a string
+        if isinstance(device, str):
+            device = torch.device(device)
+
         # Use autocast if model is in bfloat16/float16 to handle dtype conversions
         use_autocast = dtype in (torch.bfloat16, torch.float16) and device.type == "cuda"
         autocast_ctx = torch.autocast(device_type="cuda", dtype=dtype) if use_autocast else nullcontext()
