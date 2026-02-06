@@ -24,6 +24,7 @@ import sys
 import torch
 import numpy as np
 import cv2
+from contextlib import nullcontext
 from PIL import Image
 from tqdm.auto import tqdm
 from typing import Dict, List, Optional, Tuple
@@ -219,97 +220,103 @@ class SAM3Propagate:
         orig_w = video_state["orig_width"]
         n_frames = c_end - c_start
 
+        # Use autocast if model is in bfloat16/float16 to handle dtype conversions
+        use_autocast = dtype in (torch.bfloat16, torch.float16) and device.type == "cuda"
+        autocast_ctx = torch.autocast(device_type="cuda", dtype=dtype) if use_autocast else nullcontext()
+
         try:
             # Convert numpy frames to PIL Images (SAM3 init_state accepts list of PIL)
             pil_frames = _np_to_pil_list(images_np, c_start, c_end)
             
-            # Initialize SAM3 inference state with PIL images
-            inf = model.init_state(pil_frames, offload_video_to_cpu=True)
+            with autocast_ctx:
+                # Initialize SAM3 inference state with PIL images
+                inf = model.init_state(pil_frames, offload_video_to_cpu=True)
 
-            # ── prompts ──
-            if c_start == 0 or prev_mask is None:
-                self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
-            else:
-                # Seed from previous chunk's last mask - try to add as box prompt
-                try:
-                    # Find bounding box of previous mask
-                    mask_np = prev_mask.cpu().numpy() if torch.is_tensor(prev_mask) else prev_mask
-                    if mask_np.ndim > 2:
-                        mask_np = mask_np.squeeze()
-                    
-                    # Get bounding box from mask
-                    ys, xs = np.where(mask_np > 0.5)
-                    if len(ys) > 0:
-                        x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
-                        # Normalize to 0-1
-                        box_xywh = torch.tensor([[
-                            x1 / orig_w,
-                            y1 / orig_h,
-                            (x2 - x1) / orig_w,
-                            (y2 - y1) / orig_h
-                        ]], dtype=torch.float32)
-                        model.add_prompt(inf, frame_idx=0, boxes_xywh=box_xywh, box_labels=torch.tensor([1]))
-                    else:
+                # ── prompts ──
+                if c_start == 0 or prev_mask is None:
+                    self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
+                else:
+                    # Seed from previous chunk's last mask - try to add as box prompt
+                    try:
+                        # Find bounding box of previous mask
+                        mask_np = prev_mask.cpu().numpy() if torch.is_tensor(prev_mask) else prev_mask
+                        if mask_np.ndim > 2:
+                            mask_np = mask_np.squeeze()
+                        
+                        # Get bounding box from mask
+                        ys, xs = np.where(mask_np > 0.5)
+                        if len(ys) > 0:
+                            x1, y1, x2, y2 = xs.min(), ys.min(), xs.max(), ys.max()
+                            # Normalize to 0-1, use model dtype
+                            box_xywh = torch.tensor([[
+                                x1 / orig_w,
+                                y1 / orig_h,
+                                (x2 - x1) / orig_w,
+                                (y2 - y1) / orig_h
+                            ]], dtype=dtype, device=device)
+                            model.add_prompt(inf, frame_idx=0, boxes_xywh=box_xywh, 
+                                            box_labels=torch.tensor([1], dtype=torch.long, device=device))
+                        else:
+                            # Fallback: re-apply initial prompt
+                            self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
+                    except Exception as e:
+                        print(f"[SAM3]   Could not add previous mask: {e}")
                         # Fallback: re-apply initial prompt
                         self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
-                except Exception as e:
-                    print(f"[SAM3]   Could not add previous mask: {e}")
-                    # Fallback: re-apply initial prompt
-                    self._apply_initial_prompt(model, inf, prompt, device, dtype, orig_h, orig_w)
 
-            # ── propagate ──
-            masks_list = []
-            scores_list = []
+                # ── propagate ──
+                masks_list = []
+                scores_list = []
             
-            for frame_idx, out in model.propagate_in_video(
-                inf,
-                start_frame_idx=0,
-                max_frame_num_to_track=n_frames,
-                reverse=(direction == "backward"),
-            ):
-                if out is None:
-                    # No output for this frame - add placeholder
-                    masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
-                    scores_list.append(torch.tensor(0.0))
-                    continue
+                for frame_idx, out in model.propagate_in_video(
+                    inf,
+                    start_frame_idx=0,
+                    max_frame_num_to_track=n_frames,
+                    reverse=(direction == "backward"),
+                ):
+                    if out is None:
+                        # No output for this frame - add placeholder
+                        masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
+                        scores_list.append(torch.tensor(0.0))
+                        continue
+                        
+                    # out contains: out_obj_ids, out_probs, out_boxes_xywh, out_binary_masks
+                    binary_masks = out.get("out_binary_masks")  # numpy (N_objects, H, W) bool
+                    probs = out.get("out_probs")  # numpy (N_objects,)
                     
-                # out contains: out_obj_ids, out_probs, out_boxes_xywh, out_binary_masks
-                binary_masks = out.get("out_binary_masks")  # numpy (N_objects, H, W) bool
-                probs = out.get("out_probs")  # numpy (N_objects,)
-                
-                if binary_masks is not None and len(binary_masks) > 0:
-                    # Combine all object masks into one (union)
-                    combined_mask = np.any(binary_masks, axis=0)  # (H, W)
-                    mask_tensor = torch.from_numpy(combined_mask.astype(np.float32))
-                    
-                    # Resize to original resolution if needed
-                    mask_h, mask_w = mask_tensor.shape
-                    if mask_h != orig_h or mask_w != orig_w:
-                        mask_tensor = torch.nn.functional.interpolate(
-                            mask_tensor.unsqueeze(0).unsqueeze(0),
-                            size=(orig_h, orig_w),
-                            mode="bilinear",
-                            align_corners=False
-                        ).squeeze()
-                    
-                    masks_list.append(mask_tensor)
-                    scores_list.append(torch.tensor(probs.max() if probs is not None and len(probs) > 0 else 1.0))
-                else:
-                    # No masks for this frame - add placeholder
-                    masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
-                    scores_list.append(torch.tensor(0.0))
+                    if binary_masks is not None and len(binary_masks) > 0:
+                        # Combine all object masks into one (union)
+                        combined_mask = np.any(binary_masks, axis=0)  # (H, W)
+                        mask_tensor = torch.from_numpy(combined_mask.astype(np.float32))
+                        
+                        # Resize to original resolution if needed
+                        mask_h, mask_w = mask_tensor.shape
+                        if mask_h != orig_h or mask_w != orig_w:
+                            mask_tensor = torch.nn.functional.interpolate(
+                                mask_tensor.unsqueeze(0).unsqueeze(0),
+                                size=(orig_h, orig_w),
+                                mode="bilinear",
+                                align_corners=False
+                            ).squeeze()
+                        
+                        masks_list.append(mask_tensor)
+                        scores_list.append(torch.tensor(probs.max() if probs is not None and len(probs) > 0 else 1.0))
+                    else:
+                        # No masks for this frame - add placeholder
+                        masks_list.append(torch.zeros(orig_h, orig_w, dtype=torch.float32))
+                        scores_list.append(torch.tensor(0.0))
 
-            if masks_list:
-                masks = torch.stack(masks_list, dim=0).unsqueeze(1)  # (N, 1, H, W)
-                scores = torch.stack(scores_list) if scores_list else None
-                # Debug: check if we got real masks
-                nonzero_masks = sum(1 for m in masks_list if m.sum() > 0)
-                print(f"[SAM3]   Generated {len(masks_list)} masks, {nonzero_masks} non-empty")
-            else:
-                masks = torch.zeros(n_frames, 1, orig_h, orig_w, dtype=torch.float32)
-                scores = None
-                print(f"[SAM3]   WARNING: No masks generated!")
-                
+                if masks_list:
+                    masks = torch.stack(masks_list, dim=0).unsqueeze(1)  # (N, 1, H, W)
+                    scores = torch.stack(scores_list) if scores_list else None
+                    # Debug: check if we got real masks
+                    nonzero_masks = sum(1 for m in masks_list if m.sum() > 0)
+                    print(f"[SAM3]   Generated {len(masks_list)} masks, {nonzero_masks} non-empty")
+                else:
+                    masks = torch.zeros(n_frames, 1, orig_h, orig_w, dtype=torch.float32)
+                    scores = None
+                    print(f"[SAM3]   WARNING: No masks generated!")
+                    
             return masks, scores
 
         except Exception as e:
@@ -328,9 +335,13 @@ class SAM3Propagate:
         - text_str: optional text prompt
         - boxes_xywh: optional boxes in [xmin, ymin, width, height] NORMALIZED (0-1)
         - box_labels: labels for boxes (1=positive, 0=negative)
+        
+        NOTE: frame_idx should always be 0 for chunked processing since each chunk
+        starts fresh with init_state. The original video frame index is irrelevant here.
         """
         ptype = prompt.get("type", "box")
-        frame = prompt.get("frame", 0)
+        # IMPORTANT: Always use frame_idx=0 for chunks - each chunk is independent
+        # The original prompt frame only matters for which chunk gets the initial prompt
 
         pos = prompt.get("positive")
         neg = prompt.get("negative")
@@ -361,19 +372,20 @@ class SAM3Propagate:
                     ])
                     labels_list.append(1)  # positive
                 
-                boxes_xywh = torch.tensor(boxes_xywh_list, dtype=torch.float32)
-                box_labels = torch.tensor(labels_list, dtype=torch.long)
+                # Use model dtype for tensors
+                boxes_xywh = torch.tensor(boxes_xywh_list, dtype=dtype, device=device)
+                box_labels = torch.tensor(labels_list, dtype=torch.long, device=device)
         
         # Get text prompt
         text = prompt.get("text", "")
         text_str = text if ptype in ("text", "auto") and text else None
         
-        # Call SAM3's add_prompt
+        # Call SAM3's add_prompt - ALWAYS use frame_idx=0 for chunked processing
         try:
             if boxes_xywh is not None or text_str:
                 model.add_prompt(
                     inf,
-                    frame_idx=frame,
+                    frame_idx=0,  # Always 0 - chunk is independent
                     text_str=text_str,
                     boxes_xywh=boxes_xywh,
                     box_labels=box_labels,
@@ -383,9 +395,10 @@ class SAM3Propagate:
             print(f"[SAM3]   add_prompt failed: {e}")
         
         # Fallback: centre box covering middle 50%
-        fallback_box = torch.tensor([[0.25, 0.25, 0.5, 0.5]], dtype=torch.float32)  # normalized xywh
+        fallback_box = torch.tensor([[0.25, 0.25, 0.5, 0.5]], dtype=dtype, device=device)  # normalized xywh
         try:
-            model.add_prompt(inf, frame_idx=0, boxes_xywh=fallback_box, box_labels=torch.tensor([1]))
+            model.add_prompt(inf, frame_idx=0, boxes_xywh=fallback_box, 
+                            box_labels=torch.tensor([1], dtype=torch.long, device=device))
         except Exception as e:
             print(f"[SAM3]   fallback prompt also failed: {e}")
 
