@@ -1,103 +1,125 @@
-# ComfyUI-SAM3-Chunked
+# ComfyUI-SAM3 (Memory Efficient)
 
-**Memory-efficient SAM3 video segmentation for ComfyUI.**
+ComfyUI integration for Meta's SAM3 (Segment Anything Model 3) - enabling open-vocabulary image and video segmentation using natural language text prompts.
 
-Drop-in replacement for [PozzettiAndrea/ComfyUI-SAM3](https://github.com/PozzettiAndrea/ComfyUI-SAM3) that processes long videos (1000+ frames) without GPU out-of-memory errors.
+**This is a memory-efficient fork** that adds chunked video processing to handle long videos on GPUs with limited VRAM.
 
-## Why This Exists
+## Memory Efficient Features (v3.1.0)
 
-The original ComfyUI-SAM3 loads **all video frames to GPU at once**:
+- **Chunked Video Processing**: Videos are processed in configurable chunks to fit in limited VRAM
+- **Float32 Compatibility**: Automatic conversion of BFloat16 checkpoints to Float32 to avoid dtype errors
+- **VRAM Cleanup**: Automatic GPU memory clearing between chunks
+- **Temporal Overlap**: Configurable overlap between chunks for smooth tracking
 
-```
-1500 frames × 3 × 1008 × 1008 × 2 bytes  ≈  9.2 GB  →  OOM on 24 GB cards
-```
+### SAM3Propagate Parameters
 
-This package processes frames in configurable **chunks** (default 100 frames ≈ 0.6 GB), clearing GPU memory between chunks.
+| Parameter | Default | Description |
+|-----------|---------|-------------|
+| `chunk_size` | 100 | Frames per chunk. Lower = less VRAM usage |
+| `overlap_frames` | 5 | Overlap between chunks for continuity |
+| `offload_model` | False | Move model to CPU after propagation |
 
-| | Original | Chunked |
-|---|---|---|
-| 100 frames | ✅ 0.6 GB | ✅ 0.6 GB |
-| 500 frames | ⚠️ 3.1 GB | ✅ 0.6 GB |
-| 1500 frames | ❌ 9.2 GB (OOM) | ✅ 0.6 GB |
-| 3000 frames | ❌ 18.4 GB (OOM) | ✅ 0.6 GB |
+For a 4GB GPU, try `chunk_size=50`. For 8GB, `chunk_size=100-150` works well.
+
+
+https://github.com/user-attachments/assets/323df482-1f05-4c69-8681-9bfb4073f766
 
 ## Installation
 
-1. Extract into your ComfyUI `custom_nodes/` folder:
-   ```bash
-   cd ComfyUI/custom_nodes/
-   # Extract ComfyUI-SAM3-Chunked folder here
-   ```
+Install via ComfyUI Manager or clone to `ComfyUI/custom_nodes/`:
+```bash
+cd ComfyUI/custom_nodes/
+git clone https://github.com/PozzettiAndrea/ComfyUI-SAM3.git
+cd ComfyUI-SAM3
+python install.py
+```
 
-2. Install dependencies:
-   ```bash
-   cd ComfyUI-SAM3-Chunked
-   pip install -r requirements.txt
-   ```
+### Optional: GPU Acceleration for Video Tracking
 
-3. **Remove or disable** the original `ComfyUI-SAM3` package to avoid node-name conflicts (both packages register the same node names).
+For 5-10x faster video tracking, install GPU-accelerated CUDA extensions:
+```bash
+python speedup.py        # Auto-detects your GPU, ~3-5 min compilation
+```
 
-## HuggingFace Authentication (Required)
+This is **optional** and only benefits video tracking performance. Image segmentation works fine without it. The script will:
+- Auto-detect your GPU architecture and compile only for your specific GPU (75-80% faster than previous versions)
+- Auto-install CUDA toolkit via conda/micromamba if needed
+- Compile GPU-accelerated extensions (torch_generic_nms, cc_torch)
 
-The `facebook/sam3` model on HuggingFace is **gated** — you must:
+**Requirements:** NVIDIA GPU with compute capability 7.5+ (RTX 2000 series or newer), conda/micromamba environment recommended.
 
-1. **Accept the license** at https://huggingface.co/facebook/sam3
-2. **Authenticate** using ONE of these methods:
-   - Enter your token in the `hf_token` field on the LoadSAM3Model node
-   - Set environment variable: `export HF_TOKEN=your_token_here`
-   - Run in terminal: `huggingface-cli login`
-
-The model (~3.2GB) will auto-download to `ComfyUI/models/sam3/sam3.pt` on first use.
-
-## Nodes
-
-All nodes use **identical names and types** as the original package, so existing workflows load without changes.
-
-| Node | Type | Purpose |
-|------|------|---------|
-| **LoadSAM3Model** | `SAM3_MODEL` | Load checkpoint (auto-downloads from HuggingFace) |
-| **SAM3BBoxCollector** | `SAM3_BOXES_PROMPT` | Collect bounding-box prompts |
-| **SAM3VideoSegmentation** | `SAM3_VIDEO_STATE` | Initialize video state (frames stay on CPU) |
-| **SAM3Propagate** | `SAM3_VIDEO_MASKS` | Propagate masks through video **in chunks** |
-| **SAM3VideoOutput** | `MASK`, `IMAGE` | Convert masks to standard ComfyUI types |
-
-### New Parameters (on SAM3VideoSegmentation)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `chunk_size` | 100 | Frames per GPU chunk (lower = less VRAM) |
-| `overlap_frames` | 10 | Overlap between chunks for mask continuity |
-
-### New Parameters (on SAM3Propagate)
-
-| Parameter | Default | Description |
-|-----------|---------|-------------|
-| `clear_cache` | True | Free GPU memory between chunks |
-
-## Bundled SAM3 Library
-
-The package includes SAM3's core model code (`lib/sam3/`) so it works **standalone** — no separate `pip install sam3` required. If you do have SAM3 installed system-wide, that installation takes priority.
+**RTX 50-series (Blackwell):** Experimental support available via `python speedup_blackwell.py` (~45-60 sec compilation). May compile successfully but runtime stability not guaranteed due to PyTorch lacking official sm_120 support. Falls back to CPU mode if compilation fails. Track PyTorch support at [pytorch/pytorch#159207](https://github.com/pytorch/pytorch/issues/159207).
 
 ## Troubleshooting
 
-### Import Errors
-If you see `[SAM3] Cannot import sam3 library`, check the ComfyUI console for detailed error messages. Common issues:
-- Missing dependencies: `pip install huggingface_hub ftfy regex timm`
-- Python version too old: requires Python 3.10+
+### SAM3 nodes not appearing in ComfyUI
 
-### Model Download Fails
-- Ensure you've accepted the license at https://huggingface.co/facebook/sam3
-- Verify your HF token is correct
-- Check network connectivity to huggingface.co
+If SAM3 doesn't load and you see "running in pytest mode - skipping initialization" in the logs, this is a false positive detection.
 
-## Compatibility
+**Solution:** Set the environment variable before starting ComfyUI:
+```bash
+# Linux/Mac
+export SAM3_FORCE_INIT=1
 
-- **ComfyUI**: Latest
-- **Python**: 3.10+
-- **PyTorch**: 2.0+
-- **Works with**: SAM3DBody2abc, any workflow that uses SAM3 nodes
+# Windows
+set SAM3_FORCE_INIT=1
+```
 
-## License
+This forces SAM3 to initialize even if pytest is detected in your environment.
 
-- **This package**: Apache 2.0
-- **SAM3 model code** (bundled in `lib/sam3/`): Meta Platforms Inc., Apache 2.0
+### Examples
+
+![bbox](docs/bbox.png)
+
+![point](docs/point.png)
+
+![text_prompt](docs/text_prompt.png)
+
+![video](docs/video.png)
+
+## Nodes
+
+### Image Segmentation
+- **LoadSAM3Model** - Load SAM3 model for image segmentation
+- **SAM3Segmentation** - Segment objects using text prompts ("person", "cat in red", etc.)
+- **SAM3CreateBox** - Create bounding box prompts (normalized coordinates)
+- **SAM3CreatePoint** - Create point prompts with positive/negative labels
+- **SAM3CombineBoxes** - Combine multiple box prompts
+- **SAM3CombinePoints** - Combine multiple point prompts
+
+### Video Tracking
+- **SAM3VideoModelLoader** - Load SAM3 model for video tracking
+- **SAM3InitVideoSession** - Initialize video tracking session
+- **SAM3InitVideoSessionAdvanced** - Advanced session initialization with custom settings
+- **SAM3AddVideoPrompt** - Add object prompts to track in video
+- **SAM3PropagateVideo** - Propagate object tracking through video frames
+
+### Interactive Tools
+- **SAM3PointCollector** - Interactive UI for collecting point prompts
+- **SAM3BBoxCollector** - Interactive UI for drawing bounding boxes
+
+---
+
+## Quick Start
+
+1. Add **LoadSAM3Model** node (first run downloads ~3.2GB model from HuggingFace)
+2. Add **SAM3Segmentation** node, connect model
+3. Enter text prompt: `"person"`, `"cat in red"`, `"car on the left"`
+4. Get masks, visualization, boxes, and confidence scores
+
+**Text Prompt Examples:**
+- `"shoe"`, `"cat"`, `"person"` - Single objects
+- `"person in red"`, `"black car"` - With attributes
+- `"person on the left"`, `"car in background"` - Spatial relations
+
+**Video Tracking:**
+1. Use **SAM3VideoModelLoader** instead of LoadSAM3Model
+2. Initialize session with **SAM3InitVideoSession**
+3. Add prompts with **SAM3AddVideoPrompt**
+4. Propagate with **SAM3PropagateVideo**
+
+## Credits
+
+- **SAM3**: Meta AI Research (https://github.com/facebookresearch/sam3)
+- **ComfyUI Integration**: ComfyUI-SAM3
+- **Interactive Points Editor**: Adapted from [ComfyUI-KJNodes](https://github.com/kijai/ComfyUI-KJNodes) by kijai (Apache 2.0 License). The SAM3PointsEditor node is based on the PointsEditor implementation from KJNodes, simplified for SAM3-specific point-based segmentation.

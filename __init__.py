@@ -1,105 +1,125 @@
 """
-ComfyUI-SAM3-Chunked — Memory-Efficient SAM3 Video Segmentation
-================================================================
+ComfyUI-SAM3: SAM3 Integration for ComfyUI
 
-Drop-in replacement for PozzettiAndrea/ComfyUI-SAM3 with chunked processing
-to handle long videos (1000+ frames) without GPU out-of-memory errors.
+This custom node package provides integration with Meta's SAM3 (Segment Anything Model 3)
+for open-vocabulary image segmentation using text prompts and visual geometric refinement.
 
-Provides the SAME output types as the original ComfyUI-SAM3 nodes:
-  SAM3_MODEL, SAM3_VIDEO_STATE, SAM3_VIDEO_MASKS, SAM3_VIDEO_SCORES,
-  SAM3_BOXES_PROMPT, SAM3_POINTS_PROMPT, SAM3_MULTI_PROMPT, MASK, IMAGE
+Main Node:
+- LoadSAM3Model: Load SAM3 model (auto-downloads from HuggingFace)
+- SAM3Segmentation: Segment with optional text/boxes/points/masks
 
-so it slots directly into existing workflows.
+Helper Nodes (Visual Prompt Creation):
+- SAM3CreateBox: Visually create a box prompt using sliders
+- SAM3CreatePoint: Visually create a point prompt using sliders
+- SAM3CombineBoxes: Combine multiple box prompts (up to 5)
+- SAM3CombinePoints: Combine multiple point prompts (up to 10)
 
-Nodes:
-  LoadSAM3Model              →  replaces original LoadSAM3Model
-  SAM3BBoxCollector          →  replaces original SAM3BBoxCollector (interactive canvas)
-  SAM3PointCollector         →  interactive point prompt collector
-  SAM3MultiRegionCollector   →  multi-region prompt collector (points + boxes)
-  SAM3VideoSegmentation      →  replaces original SAM3VideoSegmentation
-  SAM3Propagate              →  replaces original SAM3Propagate (chunked)
-  SAM3VideoOutput            →  replaces original SAM3VideoOutput
+Interactive Features:
+- Right-click any node with IMAGE/MASK output -> "Open in SAM3 Detector"
+- Interactive point-and-click segmentation (left-click=positive, right-click=negative)
 
-Version: 1.1.0
-Author:  Claude (Anthropic) for SAM3DBody2abc project
-License: Apache 2.0  (SAM3 model code is Meta Platforms Inc., Apache 2.0)
+Video Tracking:
+- SAM3VideoModelLoader, SAM3InitVideoSession, SAM3AddVideoPrompt
+- SAM3PropagateVideo, SAM3VideoOutput, SAM3CloseVideoSession
+
+Workflow Example:
+  [SAM3CreateBox] -> [SAM3CombineBoxes] -> [SAM3Segmentation] <- [LoadImage]
+  [SAM3CreatePoint] -> [SAM3CombinePoints] -^
+
+All geometric refinement uses SAM3's grounding model approach.
+No JSON typing required - pure visual node-based workflow!
+
+Author: ComfyUI-SAM3
+Version: 2.1.0
+License: MIT
 """
 
-__version__ = "1.1.7"
-
+# Only run initialization and imports when loaded by ComfyUI, not during pytest
+# This prevents relative import errors when pytest collects test modules
 import os
-import importlib.util
+import sys
 import traceback
 
-NODE_CLASS_MAPPINGS = {}
-NODE_DISPLAY_NAME_MAPPINGS = {}
+# Version info
+__version__ = "3.1.0"  # Memory efficient chunked processing
 
-# ── Web directory for frontend JS widgets ─────────────────────
+# Track initialization status
+INIT_SUCCESS = False
+INIT_ERRORS = []
+
+# Detect if running under pytest
+# Only skip initialization when PYTEST_CURRENT_TEST env var is set.
+# This is the ONLY reliable indicator that pytest is actively running tests.
+# Note: We previously also checked '_pytest.config' in sys.modules, but this
+# caused false positives when ComfyUI or its dependencies imported pytest
+# as a dependency (see issue #7).
+# Allow override with SAM3_FORCE_INIT=1 for edge cases.
+force_init = os.environ.get('SAM3_FORCE_INIT') == '1'
+is_pytest = 'PYTEST_CURRENT_TEST' in os.environ
+skip_init = is_pytest and not force_init
+
+if not skip_init:
+    print(f"[SAM3] ComfyUI-SAM3 v{__version__} initializing...")
+
+    # Step 0: Register sam3 model folder with ComfyUI
+    try:
+        import folder_paths
+        sam3_model_dir = os.path.join(folder_paths.models_dir, "sam3")
+        os.makedirs(sam3_model_dir, exist_ok=True)
+        folder_paths.add_model_folder_path("sam3", sam3_model_dir)
+        print(f"[SAM3] [OK] Registered model folder: {sam3_model_dir}")
+    except Exception as e:
+        error_msg = f"Failed to register model folder: {str(e)}"
+        INIT_ERRORS.append(error_msg)
+        print(f"[SAM3] [WARNING] {error_msg}")
+
+    # Step 1: Import node classes
+    try:
+        from .nodes import NODE_CLASS_MAPPINGS, NODE_DISPLAY_NAME_MAPPINGS
+        print("[SAM3] [OK] Node classes imported successfully")
+        INIT_SUCCESS = True
+    except Exception as e:
+        error_msg = f"Failed to import node classes: {str(e)}"
+        INIT_ERRORS.append(error_msg)
+        print(f"[SAM3] [WARNING] {error_msg}")
+        print(f"[SAM3] Traceback:\n{traceback.format_exc()}")
+
+        # Set empty mappings if import failed
+        NODE_CLASS_MAPPINGS = {}
+        NODE_DISPLAY_NAME_MAPPINGS = {}
+
+    # Step 2: Import server to register API endpoints
+    try:
+        from . import sam3_server
+        print("[SAM3] [OK] API endpoints registered")
+    except Exception as e:
+        error_msg = f"Failed to register API endpoints: {str(e)}"
+        INIT_ERRORS.append(error_msg)
+        print(f"[SAM3] [WARNING] {error_msg}")
+        print(f"[SAM3] Traceback:\n{traceback.format_exc()}")
+
+    # Report final status
+    if INIT_SUCCESS:
+        print(f"[SAM3] [OK] Loaded successfully!")
+        print(f"[SAM3] Available nodes: {', '.join(NODE_CLASS_MAPPINGS.keys())}")
+        print(f"[SAM3] Interactive SAM3 Detector: Right-click any IMAGE/MASK node -> 'Open in SAM3 Detector'")
+    else:
+        print(f"[SAM3] [ERROR] Failed to load ({len(INIT_ERRORS)} error(s)):")
+        for error in INIT_ERRORS:
+            print(f"  - {error}")
+        print("[SAM3] Please check the errors above and your installation.")
+
+else:
+    # During testing, skip initialization to prevent import errors
+    print(f"[SAM3] ComfyUI-SAM3 v{__version__} running in pytest mode - skipping initialization")
+    print(f"[SAM3] Reason: PYTEST_CURRENT_TEST={os.environ.get('PYTEST_CURRENT_TEST')}")
+    print(f"[SAM3] If this is a false positive, set environment variable: SAM3_FORCE_INIT=1")
+
+    NODE_CLASS_MAPPINGS = {}
+    NODE_DISPLAY_NAME_MAPPINGS = {}
+
+# Web directory for custom UI (interactive SAM3 detector)
 WEB_DIRECTORY = "./web"
 
-_dir = os.path.dirname(os.path.abspath(__file__))
-_nodes = os.path.join(_dir, "nodes")
-
-
-def _load_module(name, path):
-    """Safely import a module from an absolute path."""
-    try:
-        spec = importlib.util.spec_from_file_location(name, path)
-        mod = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(mod)
-        return mod
-    except Exception as e:
-        print(f"[ComfyUI-SAM3-Chunked] Failed to load {name}: {e}")
-        traceback.print_exc()
-        return None
-
-
-# ── Model Loader ─────────────────────────────────────────────
-_loader = _load_module("sam3c_loader", os.path.join(_nodes, "sam3_model_loader.py"))
-if _loader:
-    NODE_CLASS_MAPPINGS["LoadSAM3Model"] = _loader.LoadSAM3Model
-    NODE_DISPLAY_NAME_MAPPINGS["LoadSAM3Model"] = "🎬 Load SAM3 Model"
-
-# ── BBox Collector (interactive canvas) ──────────────────────
-_bbox = _load_module("sam3c_bbox", os.path.join(_nodes, "sam3_bbox_collector.py"))
-if _bbox:
-    NODE_CLASS_MAPPINGS["SAM3BBoxCollector"] = _bbox.SAM3BBoxCollector
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3BBoxCollector"] = "🎬 SAM3 BBox Collector"
-
-# ── Point Collector (interactive canvas) ─────────────────────
-_pts = _load_module("sam3c_points", os.path.join(_nodes, "sam3_point_collector.py"))
-if _pts:
-    NODE_CLASS_MAPPINGS["SAM3PointCollector"] = _pts.SAM3PointCollector
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3PointCollector"] = "🎬 SAM3 Point Collector"
-
-# ── Multi-Region Collector (interactive canvas) ──────────────
-_multi = _load_module("sam3c_multi", os.path.join(_nodes, "sam3_multiregion_collector.py"))
-if _multi:
-    NODE_CLASS_MAPPINGS["SAM3MultiRegionCollector"] = _multi.SAM3MultiRegionCollector
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3MultiRegionCollector"] = "🎬 SAM3 Multi-Region Collector"
-
-# ── Video Segmentation (init state + prompts) ───────────────
-_vidseg = _load_module("sam3c_vidseg", os.path.join(_nodes, "sam3_video_segmentation.py"))
-if _vidseg:
-    NODE_CLASS_MAPPINGS["SAM3VideoSegmentation"] = _vidseg.SAM3VideoSegmentation
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3VideoSegmentation"] = "🎬 SAM3 Video Segmentation"
-
-# ── Propagate (chunked) ─────────────────────────────────────
-_prop = _load_module("sam3c_propagate", os.path.join(_nodes, "sam3_propagate.py"))
-if _prop:
-    NODE_CLASS_MAPPINGS["SAM3Propagate"] = _prop.SAM3Propagate
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3Propagate"] = "🎬 SAM3 Propagate (Chunked)"
-
-# ── Video Output ─────────────────────────────────────────────
-_output = _load_module("sam3c_output", os.path.join(_nodes, "sam3_video_output.py"))
-if _output:
-    NODE_CLASS_MAPPINGS["SAM3VideoOutput"] = _output.SAM3VideoOutput
-    NODE_DISPLAY_NAME_MAPPINGS["SAM3VideoOutput"] = "🎬 SAM3 Video Output"
-
-
-# ── Summary ──────────────────────────────────────────────────
-print(f"[ComfyUI-SAM3-Chunked] v{__version__} — loaded {len(NODE_CLASS_MAPPINGS)} nodes:")
-for k in NODE_CLASS_MAPPINGS:
-    print(f"  • {NODE_DISPLAY_NAME_MAPPINGS.get(k, k)}")
-
-__all__ = ["NODE_CLASS_MAPPINGS", "NODE_DISPLAY_NAME_MAPPINGS", "WEB_DIRECTORY"]
+# Export for ComfyUI
+__all__ = ['NODE_CLASS_MAPPINGS', 'NODE_DISPLAY_NAME_MAPPINGS', 'WEB_DIRECTORY']

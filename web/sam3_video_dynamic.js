@@ -5,7 +5,7 @@
  * based on the selected prompt_mode in SAM3VideoSegmentation node.
  */
 
-import { app } from "../../scripts/app.js";
+import { app } from "../../../scripts/app.js";
 
 const DEBUG = false;
 
